@@ -20,6 +20,7 @@ dependencies = [
     "requests>=2.31.0",
     "httpx>=0.26.0",
     "spacy>=3.7.2",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
     "modal>=0.57.0",
     "psycopg2-binary>=2.9.9",
     "python-dotenv>=1.0.0",
@@ -28,6 +29,7 @@ dependencies = [
     "groq>=0.4.0",
     "networkx>=3.2",
     "pyvis>=0.3.2",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +46,9 @@ stop-rag = "metakgp_rag.scripts:stop"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

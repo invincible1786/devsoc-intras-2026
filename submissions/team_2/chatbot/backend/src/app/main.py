@@ -13,8 +13,7 @@ from dotenv import load_dotenv
 
 from src.services.query_service.router import router as query_router, set_query_service
 from src.services.query_service.service import QueryService
-from src.services.chat_agent.router import router as got_router, set_got_engine
-from src.services.chat_agent.engine import SimplifiedGoTEngine
+from src.services.chat_agent.router import router as got_router
 
 # Load environment variables from team_2 root directory
 env_path = Path(__file__).resolve().parents[4] / '.env'  # Go up to team_2/
@@ -29,7 +28,8 @@ else:
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True
 )
 logger = logging.getLogger(__name__)
 
@@ -63,19 +63,11 @@ async def lifespan(app: FastAPI):
     )
     set_query_service(query_service)
     
-    # Initialize simplified GoT engine with Llama-3.3-70b
-    logger.info("Initializing Simplified Graph of Thought Engine with Llama-3.3-70b...")
-    got_engine = SimplifiedGoTEngine(
-        modal_url=modal_url,
-        groq_api_key=groq_api_key,
-        query_api_url="http://localhost:8000/query/search",
-        top_k=30  # Retrieve 30 chunks for comprehensive analysis
-    )
-    set_got_engine(got_engine)
+    # Note: GoT engine is initialized lazily in router on first request
+    logger.info("GoT Engine will be initialized on first request (lazy loading)")
     
     logger.info("All services initialized successfully")
     logger.info(f"Total documents: {query_service.get_document_count()}")
-    logger.info(f"GoT Engine: Llama-3.3-70b with top_k={got_engine.top_k}")
     
     yield
     

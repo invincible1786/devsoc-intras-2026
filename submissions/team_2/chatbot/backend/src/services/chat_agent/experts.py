@@ -1,479 +1,216 @@
 """
-Mixture of Experts (MoE) for Graph of Thought Verification
-Three specialized experts: Hallucination Hunter, Source Matcher, Logic Expert
-Uses Groq models
+Mixture of Experts (MoE) - Three Verification Experts
 """
 
 import logging
-from typing import Dict, List, Tuple
+import json
+from typing import Tuple
 import asyncio
-import re
-
-from src.utils.groq_client import GroqClient
 
 logger = logging.getLogger(__name__)
 
 
-def strip_markdown_json(text: str) -> str:
-    """Remove markdown code fences from LLM responses and extract JSON.
-    
-    Handles formats like:
-    ```json
-    {...}
-    ```
-    or
-    ```
-    {...}
-    ```
-    Also handles cases where there's extra text before or after the JSON.
-    """
-    if not text:
-        return text
+def extract_json_from_response(text: str) -> dict:
+    """Extract JSON from LLM response that may contain markdown or extra text."""
+    if not text or not text.strip():
+        raise ValueError("Empty response text")
     
     text = text.strip()
     
-    # First, try to find JSON within code fences
-    # Pattern: ```json ... ``` or ``` ... ```
-    code_fence_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
-    matches = re.findall(code_fence_pattern, text, re.DOTALL)
-    if matches:
-        # Use the last match (in case there are multiple)
-        text = matches[-1].strip()
+    # Try to find JSON in code blocks
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        parts = text.split("```")
+        if len(parts) >= 3:
+            text = parts[1].strip()
     
-    # Now try to extract just the JSON object/array
-    # Find the first { or [ and match to its closing bracket
-    import json
-    for i, char in enumerate(text):
-        if char in '{[':
-            # Try to parse from this position
-            try:
-                # Use JSONDecoder to find where valid JSON ends
-                decoder = json.JSONDecoder()
-                obj, end_idx = decoder.raw_decode(text[i:])
-                # Return the valid JSON string
-                return text[i:i+end_idx]
-            except json.JSONDecodeError:
-                continue
+    # Find first { and parse from there
+    json_start = text.find('{')
+    if json_start != -1:
+        # Try to find matching closing brace
+        brace_count = 0
+        for j in range(json_start, len(text)):
+            if text[j] == '{':
+                brace_count += 1
+            elif text[j] == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    # Found complete JSON object
+                    try:
+                        return json.loads(text[json_start:j+1])
+                    except json.JSONDecodeError:
+                        # Try to continue searching
+                        pass
     
-    return text.strip()
-
-
-class Expert:
-    """Base class for MoE experts"""
-    
-    def __init__(self, groq_client: GroqClient):
-        """
-        Initialize expert
-        
-        Args:
-            groq_client: Groq client for LLM calls
-        """
-        self.groq_client = groq_client
-    
-    async def call_llm(self, prompt: str) -> str:
-        """
-        Call Groq Expert model with the given prompt
-        
-        Args:
-            prompt: Prompt text
-        
-        Returns:
-            LLM response text (empty string on error)
-        """
-        try:
-            response = await self.groq_client.generate_expert(prompt, max_tokens=512)
-            return response if response else ""
-        except Exception as e:
-            logger.error(f"LLM call failed in {self.__class__.__name__}: {e}")
-            return ""
-    
-    async def verify(self, thought: str, context: str, graph_history: List[Dict]) -> Dict:
-        """
-        Verify a thought (to be implemented by subclasses)
-        
-        Args:
-            thought: The thought to verify
-            context: Retrieved context/chunks
-            graph_history: Last 3 nodes from the graph
-        
-        Returns:
-            Dict with score and remarks
-        """
-        raise NotImplementedError
-
-
-class HallucinationHunter(Expert):
-    """
-    Expert that detects hallucinations by comparing thought against context
-    """
-    
-    async def verify(self, thought: str, context: str, graph_history: List[Dict]) -> Dict:
-        """
-        Check if the thought contains any information not present in the context
-        
-        Returns:
-            {
-                "score": float (0-1),
-                "passed": bool,
-                "remarks": str
-            }
-        """
-        prompt = f"""You are a Hallucination Hunter for MetaKGP wiki verification. Your job is fact-checking.
-
-Context from MetaKGP wiki:
-{context}
-
-Thought to Verify:
-{thought}
-
-RULES:
-1. Check if major factual claims in the Thought are supported by the Context
-2. Minor details or reasonable inferences are acceptable
-3. If the Thought says "not available" or "insufficient information", give it a PASS
-4. Be lenient with paraphrasing and reasonable interpretations
-5. Only flag clear contradictions or completely unsupported claims
-
-CRITICAL: Return ONLY a valid JSON object, nothing else. No explanations, no markdown formatting.
-
-Output format:
-{{
-    "hallucinations_found": ["list significant unsupported claims"],
-    "confidence": 0.0-1.0,
-    "verdict": "PASS" or "FAIL"
-}}"""
-
-        response = await self.call_llm(prompt)
-        
-        # Log the raw response for debugging
-        if not response or not response.strip():
-            logger.error(f"HallucinationHunter received empty response from LLM")
-            return {
-                "score": 0.6,
-                "passed": True,
-                "remarks": "LLM returned empty response, defaulting to PASS",
-                "expert": "HallucinationHunter"
-            }
-        
-        try:
-            # Strip markdown code fences before parsing
-            import json
-            cleaned_response = strip_markdown_json(response)
-            result = json.loads(cleaned_response.strip())
-            
-            hallucinations = result.get("hallucinations_found", [])
-            confidence = float(result.get("confidence", 0.6))
-            verdict = result.get("verdict", "PASS")  # Default to PASS
-            
-            # More lenient: pass if confidence >= 0.4
-            passed = verdict == "PASS" or (confidence >= 0.4 and len(hallucinations) <= 1)
-            score = confidence if passed else (1.0 - confidence)
-            
-            remarks = f"Hallucinations: {', '.join(hallucinations)}" if hallucinations else "No hallucinations detected"
-            
-            return {
-                "score": score,
-                "passed": passed,
-                "remarks": remarks,
-                "expert": "HallucinationHunter"
-            }
-        
-        except Exception as e:
-            logger.error(f"Failed to parse HallucinationHunter response: {e}")
-            logger.error(f"Raw response was: {response}")
-            logger.error(f"Cleaned response was: {cleaned_response}")
-            return {
-                "score": 0.3,
-                "passed": False,
-                "remarks": f"Parse error: {e}",
-                "expert": "HallucinationHunter"
-            }
-
-
-class SourceMatcher(Expert):
-    """
-    Expert that verifies the thought is semantically contained in the context
-    """
-    
-    async def verify(self, thought: str, context: str, graph_history: List[Dict]) -> Dict:
-        """
-        Check if the meaning of the thought is contained in the retrieved chunks
-        
-        Returns:
-            {
-                "score": float (0-1),
-                "passed": bool,
-                "remarks": str
-            }
-        """
-        prompt = f"""You are a Source Matcher. Your job is to verify that the Thought's MEANING is fully supported by the Context.
-
-Context from MetaKGP wiki:
-{context}
-
-Thought to Verify:
-{thought}
-
-Instructions:
-1. Does the Context contain information that reasonably supports this Thought?
-2. Is the Thought a reasonable interpretation or inference from the Context?
-3. Rate your confidence from 1-10 (be generous).
-
-CRITICAL: Return ONLY a valid JSON object, nothing else. No explanations, no markdown formatting.
-
-Output format:
-{{
-    "confidence_score": 1-10,
-    "reasoning": "brief explanation",
-    "verdict": "PASS" or "FAIL"
-}}"""
-
-        response = await self.call_llm(prompt)
-        
-        # Log the raw response for debugging
-        if not response or not response.strip():
-            logger.error(f"SourceMatcher received empty response from LLM")
-            return {
-                "score": 0.6,
-                "passed": True,
-                "remarks": "LLM returned empty response, defaulting to PASS",
-                "expert": "SourceMatcher"
-            }
-        
-        try:
-            import json
-            # Strip markdown code fences before parsing
-            cleaned_response = strip_markdown_json(response)
-            result = json.loads(cleaned_response.strip())
-            
-            confidence_score = float(result.get("confidence_score", 6)) / 10.0  # Normalize to 0-1, default 0.6
-            reasoning = result.get("reasoning", "")
-            verdict = result.get("verdict", "PASS")  # Default to PASS
-            
-            # More lenient: pass if confidence >= 0.5 or verdict is PASS
-            passed = verdict == "PASS" or confidence_score >= 0.5
-            
-            return {
-                "score": confidence_score,
-                "passed": passed,
-                "remarks": reasoning,
-                "expert": "SourceMatcher"
-            }
-        
-        except Exception as e:
-            logger.error(f"Failed to parse SourceMatcher response: {e}")
-            logger.error(f"Raw response was: {response}")
-            logger.error(f"Cleaned response was: {cleaned_response}")
-            return {
-                "score": 0.3,
-                "passed": False,
-                "remarks": f"Parse error: {e}",
-                "expert": "SourceMatcher"
-            }
-
-
-class LogicExpert(Expert):
-    """
-    Expert that ensures the reasoning chain makes sense
-    """
-    
-    async def verify(self, thought: str, context: str, graph_history: List[Dict]) -> Dict:
-        """
-        Check if the thought fits logically in the reasoning chain
-        
-        Returns:
-            {
-                "score": float (0-1),
-                "passed": bool,
-                "remarks": str,
-                "action": "keep" | "merge" | "discard"
-            }
-        """
-        # Format graph history
-        history_text = ""
-        for i, node in enumerate(graph_history[-3:], 1):
-            history_text += f"{i}. {node.get('thought', '')}\n"
-        
-        prompt = f"""You are a Logic Expert. Your job is to ensure the reasoning chain is coherent and non-redundant.
-
-Previous Reasoning Steps:
-{history_text if history_text else "This is the first node."}
-
-New Thought:
-{thought}
-
-Instructions:
-1. Does this Thought logically follow from the previous steps?
-2. Is it somewhat redundant but still valuable?
-3. Does it contribute to answering the question?
-
-CRITICAL: Return ONLY a valid JSON object, nothing else. No explanations, no markdown formatting.
-
-Output format:
-{{
-    "coherence_score": 0.0-1.0,
-    "is_redundant": true/false,
-    "action": "keep" | "merge" | "discard",
-    "remarks": "brief explanation"
-}}"""
-
-        response = await self.call_llm(prompt)
-        
-        # Log the raw response for debugging
-        if not response or not response.strip():
-            logger.error(f"LogicExpert received empty response from LLM")
-            return {
-                "score": 0.7,
-                "passed": True,
-                "remarks": "LLM returned empty response, defaulting to PASS",
-                "action": "keep",
-                "expert": "LogicExpert"
-            }
-        
-        try:
-            import json
-            # Strip markdown code fences before parsing
-            cleaned_response = strip_markdown_json(response)
-            result = json.loads(cleaned_response.strip())
-            
-            coherence_score = float(result.get("coherence_score", 0.7))  # Default to 0.7
-            is_redundant = result.get("is_redundant", False)
-            action = result.get("action", "keep")
-            remarks = result.get("remarks", "")
-            
-            # More lenient: pass if coherence >= 0.4, allow some redundancy
-            passed = coherence_score >= 0.4
-            
-            return {
-                "score": coherence_score,
-                "passed": passed,
-                "remarks": remarks,
-                "action": action,
-                "expert": "LogicExpert"
-            }
-        
-        except Exception as e:
-            logger.error(f"Failed to parse LogicExpert response: {e}")
-            logger.error(f"Raw response was: {response}")
-            logger.error(f"Cleaned response was: {cleaned_response}")
-            return {
-                "score": 0.5,
-                "passed": True,
-                "remarks": f"Parse error: {e}",
-                "action": "keep",
-                "expert": "LogicExpert"
-            }
-
-
-class MoEGauntlet:
-    """
-    Orchestrates the three experts with weighted voting
-    """
-    
-    def __init__(self, groq_client: GroqClient):
-        """
-        Initialize the MoE Gauntlet with Groq client
-        
-        Args:
-            groq_client: Groq client for expert calls
-        """
-        self.hallucination_hunter = HallucinationHunter(groq_client=groq_client)
-        self.source_matcher = SourceMatcher(groq_client=groq_client)
-        self.logic_expert = LogicExpert(groq_client=groq_client)
-    
-    async def verify_thought(
-        self,
-        thought: str,
-        context: str,
-        graph_history: List[Dict]
-    ) -> Dict:
-        """
-        Run all three experts in parallel and compute weighted vote
-        
-        Weighted Voting Formula (LENIENT):
-        final_score = (source_matcher_score * 0.5) + (hallucination_score * 0.3) + (logic_score * 0.2)
-        Pass threshold: final_score > 0.5
-        
-        Args:
-            thought: The thought to verify
-            context: Retrieved context chunks
-            graph_history: Last 3 nodes from the graph
-        
-        Returns:
-            {
-                "passed": bool,
-                "final_score": float,
-                "action": str,
-                "expert_results": dict,
-                "remarks": str
-            }
-        """
-        logger.info(f"Running MoE Gauntlet on thought: {thought[:100]}...")
-        
-        # Run all experts in parallel
-        results = await asyncio.gather(
-            self.hallucination_hunter.verify(thought, context, graph_history),
-            self.source_matcher.verify(thought, context, graph_history),
-            self.logic_expert.verify(thought, context, graph_history),
-            return_exceptions=True
-        )
-        
-        hallucination_result, source_result, logic_result = results
-        
-        # Handle any exceptions - be generous with defaults
-        if isinstance(hallucination_result, Exception):
-            hallucination_result = {"score": 0.6, "passed": True, "remarks": str(hallucination_result)}
-        if isinstance(source_result, Exception):
-            source_result = {"score": 0.6, "passed": True, "remarks": str(source_result)}
-        if isinstance(logic_result, Exception):
-            logic_result = {"score": 0.7, "passed": True, "action": "keep", "remarks": str(logic_result)}
-        
-        # Weighted voting (very lenient)
-        # Source Matcher (40%), Hallucination Hunter (30%), Logic Expert (30%)
-        final_score = (
-            source_result["score"] * 0.4 + 
-            hallucination_result["score"] * 0.3 + 
-            logic_result["score"] * 0.3
-        )
-        
-        # Check if thought passes
-        source_pass = source_result["passed"]
-        hallucination_pass = hallucination_result["passed"]
-        logic_pass = logic_result["passed"]
-        
-        # Very lenient rules
-        # Pass if final_score >= 0.35 OR if at least 1 expert passes
-        experts_passed = sum([source_pass, hallucination_pass, logic_pass])
-        
-        # Almost always pass - only fail if score is very low AND no experts passed
-        if final_score < 0.25 and experts_passed == 0:
-            passed = False
-            action = "discard"
-            remarks = f"FAILED: Very low score {final_score:.2f}, no experts passed"
-        else:
-            # Check Logic Expert's recommendation
-            if logic_result.get("action") == "merge":
-                passed = True
-                action = "merge"
-                remarks = f"PASSED (score: {final_score:.2f}) - flagged as redundant, merging"
-            elif logic_result.get("action") == "discard" and final_score < 0.2:
-                passed = False
-                action = "discard"
-                remarks = f"FAILED: Logic Expert rejected and very low score ({final_score:.2f})"
-            else:
-                passed = True
-                action = "keep"
-                remarks = f"PASSED: score {final_score:.2f}, {experts_passed}/3 experts approved"
-        
-        logger.info(f"MoE Verdict: {remarks}")
-        
+    # Last resort: try to parse the whole thing
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Return a default error response instead of raising
+        logger.warning(f"Could not extract JSON from response: {e}\nText: {text[:200]}")
         return {
-            "passed": passed,
-            "final_score": final_score,
-            "action": action,
-            "expert_results": {
-                "hallucination_hunter": hallucination_result,
-                "source_matcher": source_result,
-                "logic_expert": logic_result
-            },
-            "remarks": remarks
+            "verdict": "NO",
+            "confidence": 0.0,
+            "reasoning": f"JSON parsing error: {str(e)[:100]}"
         }
+
+
+async def source_matcher(claim: str, context: str, groq_client) -> Tuple[bool, float, str]:
+    """
+    Expert 1: Verify if claim is directly supported by context.
+    
+    Args:
+        claim: The claim to verify
+        context: Source text
+        groq_client: Groq client
+        
+    Returns:
+        (verdict, confidence, reasoning)
+    """
+    prompt = f"""You are a Source Matcher. Verify if a claim is supported by context.
+
+CLAIM:
+{claim}
+
+SOURCE TEXT:
+{context}
+
+TASK: Does the SOURCE TEXT explicitly support this CLAIM?
+
+EVALUATION:
+- Check if key facts (names, roles, dates, numbers) in the claim are present in context
+- The claim must be DIRECTLY supported, not inferred
+- Be STRICT: if something isn't explicit, mark as unsupported
+
+Return ONLY valid JSON:
+{{
+    "verdict": "YES" or "NO",
+    "confidence": 0.0 to 1.0,
+    "reasoning": "brief explanation"
+}}"""
+
+    try:
+        response = await groq_client.generate_expert(prompt, max_tokens=512)
+        result = extract_json_from_response(response)
+        
+        verdict = result.get("verdict", "NO") == "YES"
+        confidence = float(result.get("confidence", 0.0))
+        reasoning = result.get("reasoning", "")
+        
+        return verdict, confidence, reasoning
+        
+    except Exception as e:
+        logger.error(f"Source Matcher error: {e}")
+        return False, 0.0, f"Error: {e}"
+
+
+async def hallucination_hunter(claim: str, context: str, original_query: str, groq_client) -> Tuple[bool, float, str]:
+    """
+    Expert 2: Detect if the claim invents details not in context.
+    
+    Args:
+        claim: The claim to verify
+        context: Source text
+        original_query: Original user query
+        groq_client: Groq client
+        
+    Returns:
+        (is_hallucinating, confidence, invented_details)
+    """
+    prompt = f"""You are a Hallucination Hunter. Detect invented information.
+
+ORIGINAL QUERY:
+{original_query}
+
+CLAIM/RESPONSE:
+{claim}
+
+SCRAPED CONTEXT:
+{context}
+
+TASK: Is the CLAIM inventing details NOT present in the context?
+
+WHAT COUNTS AS HALLUCINATION:
+- Names not mentioned in context
+- Dates or numbers not in context
+- Events or facts completely fabricated
+- Roles or positions invented
+
+WHAT IS ACCEPTABLE:
+- Direct quotes or paraphrases from context
+- Information explicitly stated in context
+
+Return ONLY valid JSON:
+{{
+    "is_hallucinating": true or false,
+    "confidence": 0.0 to 1.0,
+    "invented_details": "list specific invented details or 'None'"
+}}"""
+
+    try:
+        response = await groq_client.generate_expert(prompt, max_tokens=512)
+        result = extract_json_from_response(response)
+        
+        is_hallucinating = result.get("is_hallucinating", True)
+        confidence = float(result.get("confidence", 0.5))
+        details = result.get("invented_details", "Unknown")
+        
+        return is_hallucinating, confidence, details
+        
+    except Exception as e:
+        logger.error(f"Hallucination Hunter error: {e}")
+        return True, 0.5, f"Error: {e}"
+
+
+async def logic_expert(claim: str, context: str, question: str, groq_client) -> Tuple[bool, float, str]:
+    """
+    Expert 3: Verify if conclusion logically follows from premises.
+    
+    Args:
+        claim: The conclusion
+        context: The premises
+        question: The question being answered
+        groq_client: Groq client
+        
+    Returns:
+        (is_logical, confidence, reasoning)
+    """
+    prompt = f"""You are a Logic Expert. Verify logical reasoning.
+
+QUESTION:
+{question}
+
+PREMISES (from context):
+{context}
+
+CONCLUSION (bot's claim):
+{claim}
+
+TASK: Does the CONCLUSION logically follow from the PREMISES?
+
+EVALUATION:
+1. Are premises clearly stated?
+2. Does conclusion follow logically?
+3. Any logical fallacies or leaps?
+
+Return ONLY valid JSON:
+{{
+    "is_logical": true or false,
+    "confidence": 0.0 to 1.0,
+    "reasoning": "brief explanation"
+}}"""
+
+    try:
+        response = await groq_client.generate_expert(prompt, max_tokens=512)
+        result = extract_json_from_response(response)
+        
+        is_logical = result.get("is_logical", False)
+        confidence = float(result.get("confidence", 0.0))
+        reasoning = result.get("reasoning", "")
+        
+        return is_logical, confidence, reasoning
+        
+    except Exception as e:
+        logger.error(f"Logic Expert error: {e}")
+        return False, 0.0, f"Error: {e}"

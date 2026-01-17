@@ -1,145 +1,121 @@
 """
-Simplified Graph of Thought (GoT) Service Router
-FastAPI endpoints for the simplified GoT reasoning service using Llama-4-Scout
+FastAPI Router for Graph of Thoughts + MoE System
 """
-
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, List
 import logging
-import os
+from typing import Optional, Dict, Any
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
-from src.services.chat_agent.engine import SimplifiedGoTEngine
+from src.services.chat_agent.got_moe_engine import GoTMoEEngine
+from src.utils.chroma_client import MetaKGPChromaClient
+from src.utils.embedding_client import ModalEmbeddingClient
+from src.utils.groq_client import GroqClient
 
 logger = logging.getLogger(__name__)
 
-# Create router
 router = APIRouter(
     prefix="/got",
-    tags=["graph-of-thought"],
-    responses={404: {"description": "Not found"}},
+    tags=["Graph of Thoughts"]
 )
 
-# Global engine instance
-_got_engine: Optional[SimplifiedGoTEngine] = None
+_engine: Optional[GoTMoEEngine] = None
 
 
-def get_got_engine() -> SimplifiedGoTEngine:
-    """Dependency to get the GoT engine instance"""
-    if _got_engine is None:
-        raise HTTPException(
-            status_code=503,
-            detail="GoT engine not initialized"
-        )
-    return _got_engine
+class QueryRequest(BaseModel):
+    query: str
+    use_cache: Optional[bool] = True
+    max_depth: Optional[int] = 3
+    max_branches: Optional[int] = 3
 
 
-def set_got_engine(engine: SimplifiedGoTEngine):
-    """Set the global GoT engine instance"""
-    global _got_engine
-    _got_engine = engine
-
-
-# Pydantic models
-class GoTQueryRequest(BaseModel):
-    """Request model for GoT query"""
-    query: str = Field(..., description="The question to answer using MetaKGP wiki")
-
-
-class GoTQueryResponse(BaseModel):
-    """Response model for GoT query"""
+class QueryResponse(BaseModel):
     query: str
     answer: str
-    confidence: float = Field(..., ge=0.0, le=1.0)
-    chunks_retrieved: int
-    verification_passed: bool
-    verification_score: Optional[float] = None
-    reasoning: Optional[str] = None
-    sources: Optional[List[str]] = None
-    error: Optional[str] = None
+    confidence: float
+    sources: list[str] = []
+    reasoning_path: list[Dict[str, Any]] = []
+    graph_stats: Optional[Dict[str, Any]] = None
+    visualization_path: Optional[str] = None
+    cached: bool = False
 
 
-class GraphStatusResponse(BaseModel):
-    """Response model for graph status"""
+class HealthResponse(BaseModel):
     status: str
     engine_initialized: bool
-    model: str
-    top_k: int
+    cache_enabled: bool
 
 
-# API Endpoints
+class StatsResponse(BaseModel):
+    total_thoughts: int
+    verified_thoughts: int
+    cached_graphs: int
+    cache_size_mb: float
 
-@router.post("/query", response_model=GoTQueryResponse)
-async def query_got(
-    request: GoTQueryRequest,
-    engine: SimplifiedGoTEngine = Depends(get_got_engine)
-):
-    """
-    Process a query using simplified Graph of Thought reasoning with Llama-3.3-70b
-    
-    Pipeline:
-    1. Check if query is relevant to IIT Kharagpur/MetaKGP
-    2. Query RAG for top 30 relevant chunks
-    3. Analyze chunks using Graph of Thought reasoning
-    4. Run single MoE verification round (3 experts)
-    5. Generate final answer
-    
-    Example request:
-    ```json
-    {
-        "query": "What is the hostel allocation process at IIT Kharagpur?"
-    }
-    ```
-    
-    The response includes:
-    - Final answer
-    - Confidence score
-    - Verification status
-    - Source pages
-    """
+
+def get_engine() -> GoTMoEEngine:
+    global _engine
+    if _engine is None:
+        logger.info("Initializing GoTMoEEngine...")
+        try:
+            chroma_client = MetaKGPChromaClient()
+            embedding_client = ModalEmbeddingClient()
+            groq_client = GroqClient()
+            _engine = GoTMoEEngine(
+                chroma_client=chroma_client,
+                embedding_client=embedding_client,
+                groq_client=groq_client
+            )
+            logger.info("GoTMoEEngine initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize GoTMoEEngine: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize reasoning engine: {str(e)}")
+    return _engine
+
+
+@router.post("/query", response_model=QueryResponse)
+async def process_query(request: QueryRequest) -> QueryResponse:
     try:
-        logger.info(f"Received GoT query: {request.query}")
-        
-        # Process query through simplified GoT engine
+        engine = get_engine()
+        logger.info(f"Processing query: {request.query}")
         result = await engine.process_query(query=request.query)
-        
-        return GoTQueryResponse(**result)
-    
-    except Exception as e:
-        logger.error(f"GoT query failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Query processing failed: {str(e)}"
+        response = QueryResponse(
+            query=request.query,
+            answer=result.get("answer", ""),
+            confidence=result.get("confidence", 0.0),
+            sources=result.get("sources", []),
+            reasoning_path=result.get("reasoning_path", []),
+            graph_stats=result.get("graph_stats"),
+            visualization_path=None,
+            cached=False
         )
+        logger.info(f"Query processed: {request.query[:50]}...")
+        return response
+    except Exception as e:
+        logger.error(f"Error processing query: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
 
-@router.get("/graph-status", response_model=GraphStatusResponse)
-async def graph_status(engine: SimplifiedGoTEngine = Depends(get_got_engine)):
-    """
-    Get status of the GoT engine
-    
-    Returns:
-    - Engine initialization status
-    - Model being used
-    - Configuration details
-    """
+@router.get("/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
     try:
-        return GraphStatusResponse(
-            status="ok",
-            engine_initialized=True,
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            top_k=engine.top_k
-        )
-    
+        engine = get_engine()
+        return HealthResponse(status="healthy", engine_initialized=True, cache_enabled=True)
     except Exception as e:
-        logger.error(f"Status check failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Status check failed: {str(e)}"
+        logger.error(f"Health check failed: {e}")
+        return HealthResponse(status="unhealthy", engine_initialized=False, cache_enabled=False)
+
+
+@router.get("/stats", response_model=StatsResponse)
+async def get_stats() -> StatsResponse:
+    try:
+        engine = get_engine()
+        graph_stats = engine.get_graph_stats()
+        return StatsResponse(
+            total_thoughts=graph_stats["total_nodes"],
+            verified_thoughts=graph_stats["total_nodes"],  # All stored nodes are verified
+            cached_graphs=0,
+            cache_size_mb=0.0
         )
-
-
-@router.get("/health")
-async def health():
-    """Simple health check"""
-    return {"status": "ok", "service": "GoT"}
+    except Exception as e:
+        logger.error(f"Failed to get stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve statistics: {str(e)}")

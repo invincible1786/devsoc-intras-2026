@@ -73,7 +73,6 @@ export CACHE_DIR="$CACHE_ABS_PATH"
 uvicorn src.app.main:app \
     --host "${HOST:-0.0.0.0}" \
     --port "${PORT:-8000}" \
-    --log-level info \
     > logs/fastapi_server.log 2>&1 &
 
 FastAPI_PID=$!
