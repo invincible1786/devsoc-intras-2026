@@ -71,7 +71,7 @@ class MetaKGPChromaClient:
             "source_page": meta["source_page"],
             "title": meta["title"],
             "chunk_index": meta["chunk_index"],
-            "total_chunks": meta["total_chunks"],
+            "total_chunks": meta.get("total_chunks", 0),  # Default to 0 if not present
             
             # Serialize arrays as comma-separated strings
             "categories": ",".join(meta["categories"]) if meta["categories"] else "",

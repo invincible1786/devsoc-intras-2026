@@ -6,21 +6,27 @@ Features:
 - Timeouts (5s connect, 30s read)
 - Keep-alive headers
 - Async support with httpx
+- Batch processing support
 """
 
 import os
 import logging
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Union
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import time
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 class ModalEmbeddingClient:
-    """Client for Modal embedding service with connection pooling and retry logic"""
+    """
+    Embedding client for Modal API service
+    
+    Supports the Modal embedding service with connection pooling and retry logic.
+    """
     
     def __init__(self, modal_url: Optional[str] = None):
         """
@@ -65,86 +71,80 @@ class ModalEmbeddingClient:
             "Content-Type": "application/json"
         })
         
-        # Timeouts
-        self.connect_timeout = 5
-        self.read_timeout = 30
+        # Timeouts - increased for batch processing
+        self.connect_timeout = 10
+        self.read_timeout = 120  # 2 minutes for large batches
         
-        logger.info(f" ModalEmbeddingClient initialized with URL: {self.modal_url}")
+        logger.info(f"✓ ModalEmbeddingClient initialized with URL: {self.modal_url}")
     
-    def __call__(self, text: str) -> Optional[List[float]]:
+    def encode(self, text: Union[str, List[str]]) -> Union[np.ndarray, List[float], None]:
         """
-        Generate embedding for a single text
+        Generate embedding(s) for text(s)
         
         Args:
-            text: Text to embed
-            
+            text: Single text string or list of texts
+        
         Returns:
-            Embedding vector (list of floats) or None if failed
+            - Single text: list of floats
+            - Multiple texts: list of lists
+            - None if failed
         """
+        is_single = isinstance(text, str)
+        texts = [text] if is_single else text
+        
+        results = []
+        for t in texts:
+            emb = self._embed_single(t)
+            if emb is None:
+                return None
+            results.append(emb)
+        
+        return results[0] if is_single else results
+    
+    def _embed_single(self, text: str) -> Optional[List[float]]:
+        """Generate embedding using Modal API"""
         if not text or not text.strip():
             logger.warning("Empty text provided for embedding")
             return None
         
         try:
-            # Prepare request payload
             payload = {
                 "doc_id": f"doc_{hash(text)}",
                 "content": text,
                 "metadata": {}
             }
             
-            # Make request with timeouts
             response = self.session.post(
                 f"{self.modal_url}/embedding/embed",
                 json=payload,
                 timeout=(self.connect_timeout, self.read_timeout)
             )
             
-            # Check response
             response.raise_for_status()
-            
-            # Parse embeddings
             result = response.json()
             embeddings = result.get("embeddings", [])
             
-            if embeddings and len(embeddings) > 0:
-                return embeddings[0]
-            else:
-                logger.error("No embeddings returned from service")
-                return None
-        
-        except requests.exceptions.Timeout:
-            logger.error("Embedding request timed out")
-            return None
-        
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Embedding request failed: {e}")
-            return None
+            return embeddings[0] if embeddings else None
         
         except Exception as e:
-            logger.error(f"Unexpected error in embedding: {e}")
+            logger.error(f"❌ Modal API error: {e}")
             return None
     
-    def embed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
+    def __call__(self, text: str) -> Optional[List[float]]:
         """
-        Generate embeddings for multiple texts
+        Generate embedding for a single text (backward compatibility)
         
         Args:
-            texts: List of texts to embed
-            
+            text: Text to embed
+        
         Returns:
-            List of embedding vectors (or None for failed embeddings)
+            Embedding vector or None
         """
-        embeddings = []
-        
-        for text in texts:
-            embedding = self(text)
-            embeddings.append(embedding)
-            
-            # Brief pause to avoid rate limiting
-            time.sleep(0.01)
-        
-        return embeddings
+        return self.encode(text)
+    
+    def get_dimension(self) -> int:
+        """Get embedding dimension (default for Modal service)"""
+        return 768  # Modal uses all-mpnet-base-v2
     
     def health_check(self) -> bool:
         """
@@ -165,20 +165,20 @@ class ModalEmbeddingClient:
             is_healthy = result.get("status") == "ok"
             
             if is_healthy:
-                logger.info(f" Embedding service healthy (dimension: {result.get('embedding_dimension')})")
+                logger.info(f"✓ Embedding service healthy (dimension: {result.get('embedding_dimension')})")
             else:
-                logger.warning("️ Embedding service returned unhealthy status")
+                logger.warning("⚠️ Embedding service returned unhealthy status")
             
             return is_healthy
         
         except Exception as e:
-            logger.error(f" Health check failed: {e}")
+            logger.error(f"❌ Health check failed: {e}")
             return False
     
     def close(self):
-        """Close session and cleanup resources"""
+        """Close session and cleanup"""
         self.session.close()
-        logger.info(" Embedding client session closed")
+        logger.info("✓ Embedding client session closed")
     
     def __enter__(self):
         """Context manager entry"""
@@ -188,103 +188,3 @@ class ModalEmbeddingClient:
         """Context manager exit"""
         self.close()
 
-
-class AsyncModalEmbeddingClient:
-    """Async version of embedding client using httpx"""
-    
-    def __init__(self, modal_url: Optional[str] = None):
-        """
-        Initialize async embedding client
-        
-        Args:
-            modal_url: Modal embedding service URL
-        """
-        self.modal_url = modal_url or os.getenv("MODAL_URL")
-        
-        if not self.modal_url:
-            raise ValueError("Modal URL not provided and MODAL_URL env variable not set")
-        
-        self.modal_url = self.modal_url.rstrip('/')
-        
-        # httpx client will be created when needed
-        self._client = None
-        
-        self.connect_timeout = 5
-        self.read_timeout = 30
-        
-        logger.info(f" AsyncModalEmbeddingClient initialized with URL: {self.modal_url}")
-    
-    async def _get_client(self):
-        """Lazy initialization of httpx client"""
-        if self._client is None:
-            import httpx
-            
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    connect=self.connect_timeout,
-                    read=self.read_timeout
-                ),
-                limits=httpx.Limits(
-                    max_keepalive_connections=10,
-                    max_connections=20
-                )
-            )
-        
-        return self._client
-    
-    async def __call__(self, text: str) -> Optional[List[float]]:
-        """
-        Generate embedding for a single text (async)
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Embedding vector or None if failed
-        """
-        if not text or not text.strip():
-            logger.warning("Empty text provided for embedding")
-            return None
-        
-        try:
-            client = await self._get_client()
-            
-            payload = {
-                "doc_id": f"doc_{hash(text)}",
-                "content": text,
-                "metadata": {}
-            }
-            
-            response = await client.post(
-                f"{self.modal_url}/embedding/embed",
-                json=payload
-            )
-            
-            response.raise_for_status()
-            
-            result = response.json()
-            embeddings = result.get("embeddings", [])
-            
-            if embeddings and len(embeddings) > 0:
-                return embeddings[0]
-            else:
-                logger.error("No embeddings returned from service")
-                return None
-        
-        except Exception as e:
-            logger.error(f"Async embedding request failed: {e}")
-            return None
-    
-    async def close(self):
-        """Close async client"""
-        if self._client:
-            await self._client.aclose()
-            logger.info(" Async embedding client closed")
-    
-    async def __aenter__(self):
-        """Async context manager entry"""
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        await self.close()

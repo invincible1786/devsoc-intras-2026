@@ -58,19 +58,22 @@ class SearchResultMetadata(BaseModel):
     """Metadata for a search result"""
     source_page: str
     title: str
+    section: str = ""
     chunk_index: int
-    total_chunks: int
-    categories: List[str]
-    entities: List[str]
-    entity_count: int
-    relationship_count: int
+    total_chunks: int = 0  # Default to 0 if not present
+    categories: List[str] = []
+    entities: List[str] = []
+    entity_count: int = 0
+    relationship_count: int = 0  # Default to 0 if not present
 
 
 class SearchResult(BaseModel):
     """Single search result"""
     chunk_id: str
     text: str
-    score: float = Field(..., ge=0.0, le=1.0, description="Relevance score (0-1)")
+    score: float = Field(..., ge=0.0, description="Relevance score (similarity)")
+    distance: Optional[float] = Field(None, description="Vector distance")
+    rank: int = Field(..., description="Result rank (1-indexed)")
     metadata: SearchResultMetadata
 
 
@@ -79,6 +82,7 @@ class SearchResponse(BaseModel):
     results: List[SearchResult]
     query_time_ms: float
     total_results: int
+    search_mode: str = Field(default="semantic", description="Search mode: semantic")
 
 
 class HealthResponse(BaseModel):
@@ -96,13 +100,27 @@ async def search(
     service: QueryService = Depends(get_query_service)
 ):
     """
-    Semantic search over wiki chunks
+    Semantic search over wiki chunks using vector similarity
+    
+    Uses 768-dimensional embeddings from all-mpnet-base-v2 model
+    to find semantically similar content.
     
     Example request:
     ```json
     {
         "query": "Who is the vice president of TSG?",
+        "top_k": 5
+    }
+    ```
+    
+    With filters:
+    ```json
+    {
+        "query": "What are the selection criteria?",
         "top_k": 5,
+        "filters": {
+            "source_page": "180 Degrees Consulting"
+        }
     }
     ```
     """
@@ -129,6 +147,8 @@ async def search(
                 chunk_id=r["chunk_id"],
                 text=r["text"],
                 score=r["score"],
+                distance=r.get("distance"),
+                rank=r["rank"],
                 metadata=SearchResultMetadata(**r["metadata"])
             )
             for r in result["results"]
@@ -137,7 +157,8 @@ async def search(
         return SearchResponse(
             results=search_results,
             query_time_ms=result["query_time_ms"],
-            total_results=result["total_results"]
+            total_results=result["total_results"],
+            search_mode=result.get("search_mode", "semantic")
         )
     
     except ValueError as e:

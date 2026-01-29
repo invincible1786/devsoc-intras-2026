@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from src.utils.embedding_client import ModalEmbeddingClient
-from src.utils.chunk_processor import WikiChunkProcessor
+from src.utils.chunk_processor import AdvancedWikiChunkProcessor
 from src.utils.chroma_client import MetaKGPChromaClient
 
 # Setup logging
@@ -42,8 +42,8 @@ class MetaKGPIndexer:
         chroma_dir: str = "./chroma_data",
         cache_dir: str = "./cache",
         batch_size: int = 100,
-        embedding_batch_size: int = 30,
-        reset_offset: bool = False
+        embedding_batch_size: int = 50,  # Reduced to avoid timeouts
+        reset_offset: bool = False,
     ):
         """
         Initialize MetaKGP indexer
@@ -62,10 +62,18 @@ class MetaKGPIndexer:
         self.embedding_batch_size = embedding_batch_size
         
         # Initialize components
-        logger.info(" Initializing MetaKGP Indexer...")
+        logger.info("⚙️ Initializing MetaKGP Indexer...")
         
+        # Use Modal API for embeddings
         self.embedding_client = ModalEmbeddingClient(modal_url)
-        self.chunk_processor = WikiChunkProcessor(chunk_size=512, chunk_overlap=50)
+        
+        # Use AdvancedWikiChunkProcessor with improved chunking
+        self.chunk_processor = AdvancedWikiChunkProcessor(
+            chunk_size=400,          # 400 tokens (recommended)
+            chunk_overlap=100,       # 25% overlap
+            max_chunk_size=800,      # Hard limit
+            use_large_model=False    # Use en_core_web_md (False) or en_core_web_lg (True)
+        )
         self.chroma_client = MetaKGPChromaClient(
             persist_dir=chroma_dir,
             collection_name="metakgp_wiki"
@@ -156,11 +164,17 @@ class MetaKGPIndexer:
             self._cache_hits += 1
             return self.embedding_cache[cache_key]
         
-        # Cache miss - call Modal API
+        # Cache miss - generate embedding
         self._cache_misses += 1
-        embedding = self.embedding_client(text)
         
-        if embedding:
+        # Use encode method for better compatibility
+        embedding = self.embedding_client.encode(text)
+        
+        if embedding is not None:
+            # Convert to list if numpy array
+            if hasattr(embedding, 'tolist'):
+                embedding = embedding.tolist()
+            
             self.embedding_cache[cache_key] = embedding
             return embedding
         
@@ -256,29 +270,121 @@ class MetaKGPIndexer:
             f"from {len(pages)} pages"
         )
         
-        # Step 2: Generate embeddings
+        # Step 2: Generate embeddings in batches
         chunk_ids = []
         texts = []
         embeddings = []
         successful_chunks = []
         
-        for chunk_obj in all_chunk_objects:
-            try:
-                # Get embedding (with cache)
-                embedding = self._get_embedding(chunk_obj["text"])
-                
-                if embedding:
-                    chunk_ids.append(chunk_obj["chunk_id"])
-                    texts.append(chunk_obj["text"])
-                    embeddings.append(embedding)
-                    successful_chunks.append(chunk_obj)
-                else:
-                    logger.warning(f"️ Skipping chunk {chunk_obj['chunk_id']} - no embedding")
-            
-            except Exception as e:
-                logger.error(f" Failed to embed chunk: {e}")
+        logger.info(f"🔄 Processing embeddings in batches of {self.embedding_batch_size}...")
         
-        logger.info(f" Generated {len(embeddings)} embeddings")
+        # Process in batches
+        for i in range(0, len(all_chunk_objects), self.embedding_batch_size):
+            batch = all_chunk_objects[i:i+self.embedding_batch_size]
+            batch_end = min(i + self.embedding_batch_size, len(all_chunk_objects))
+            
+            logger.debug(f"Processing batch {i//self.embedding_batch_size + 1}: chunks {i+1}-{batch_end}")
+            
+            # Separate cached and uncached chunks
+            cached_chunks = []
+            uncached_chunks = []
+            uncached_texts = []
+            
+            for chunk_obj in batch:
+                cache_key = chunk_obj["text"][:200]
+                
+                if cache_key in self.embedding_cache:
+                    # Use cached embedding
+                    self._cache_hits += 1
+                    cached_chunks.append((chunk_obj, self.embedding_cache[cache_key]))
+                else:
+                    # Need to generate embedding
+                    self._cache_misses += 1
+                    uncached_chunks.append(chunk_obj)
+                    uncached_texts.append(chunk_obj["text"])
+            
+            # Batch generate embeddings for uncached chunks
+            if uncached_texts:
+                try:
+                    # Split into smaller sub-batches to avoid timeouts
+                    sub_batch_size = 25  # Smaller batches for reliability
+                    
+                    for i in range(0, len(uncached_texts), sub_batch_size):
+                        sub_texts = uncached_texts[i:i + sub_batch_size]
+                        sub_chunks = uncached_chunks[i:i + sub_batch_size]
+                        
+                        try:
+                            # Use encode method which can handle lists
+                            batch_embeddings = self.embedding_client.encode(sub_texts)
+                            
+                            # Handle both single and multiple results
+                            if isinstance(batch_embeddings, list) and len(batch_embeddings) > 0:
+                                if not isinstance(batch_embeddings[0], list):
+                                    # Single result returned as flat list
+                                    batch_embeddings = [batch_embeddings]
+                                
+                                # Cache and store results
+                                for chunk_obj, embedding in zip(sub_chunks, batch_embeddings):
+                                    if embedding:
+                                        cache_key = chunk_obj["text"][:200]
+                                        self.embedding_cache[cache_key] = embedding
+                                        
+                                        chunk_ids.append(chunk_obj["chunk_id"])
+                                        texts.append(chunk_obj["text"])
+                                        embeddings.append(embedding)
+                                        successful_chunks.append(chunk_obj)
+                            else:
+                                logger.warning(f"⚠️ No embeddings returned for sub-batch")
+                                # Try individual fallback for this sub-batch
+                                for chunk_obj in sub_chunks:
+                                    try:
+                                        embedding = self._get_embedding(chunk_obj["text"])
+                                        if embedding:
+                                            chunk_ids.append(chunk_obj["chunk_id"])
+                                            texts.append(chunk_obj["text"])
+                                            embeddings.append(embedding)
+                                            successful_chunks.append(chunk_obj)
+                                    except Exception as e3:
+                                        logger.error(f"❌ Failed to embed chunk {chunk_obj['chunk_id']}: {e3}")
+                        
+                        except Exception as e2:
+                            logger.error(f"❌ Sub-batch embedding failed: {e2}")
+                            # Fallback: try one by one for this sub-batch
+                            logger.info(f"🔄 Falling back to individual embedding for sub-batch...")
+                            for chunk_obj in sub_chunks:
+                                try:
+                                    embedding = self._get_embedding(chunk_obj["text"])
+                                    if embedding:
+                                        chunk_ids.append(chunk_obj["chunk_id"])
+                                        texts.append(chunk_obj["text"])
+                                        embeddings.append(embedding)
+                                        successful_chunks.append(chunk_obj)
+                                except Exception as e3:
+                                    logger.error(f"❌ Failed to embed chunk {chunk_obj['chunk_id']}: {e3}")
+                
+                except Exception as e:
+                    logger.error(f"❌ Batch processing failed completely: {e}")
+                    # Last resort: try all individually
+                    logger.info("🔄 Final fallback to individual embedding...")
+                    for chunk_obj in uncached_chunks:
+                        try:
+                            embedding = self._get_embedding(chunk_obj["text"])
+                            if embedding:
+                                chunk_ids.append(chunk_obj["chunk_id"])
+                                texts.append(chunk_obj["text"])
+                                embeddings.append(embedding)
+                                successful_chunks.append(chunk_obj)
+                        except Exception as e4:
+                            logger.error(f"❌ Failed to embed chunk {chunk_obj['chunk_id']}: {e4}")
+            
+            # Add cached chunks to results
+            for chunk_obj, embedding in cached_chunks:
+                chunk_ids.append(chunk_obj["chunk_id"])
+                texts.append(chunk_obj["text"])
+                embeddings.append(embedding)
+                successful_chunks.append(chunk_obj)
+        
+        logger.info(f"✅ Generated {len(embeddings)} embeddings (hits: {self._cache_hits}, misses: {self._cache_misses})")
         
         # Step 3: Add to ChromaDB
         if chunk_ids:
@@ -439,7 +545,7 @@ def main():
     parser.add_argument(
         "--embedding-batch-size",
         type=int,
-        default=30,
+        default=50,  # Reduced to 50 to avoid timeouts
         help="Number of chunks to embed in parallel"
     )
     parser.add_argument(

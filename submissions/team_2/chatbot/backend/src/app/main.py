@@ -41,38 +41,44 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events
     """
     # Startup
-    logger.info("Starting MetaKGP API...")
+    logger.info("🚀 Starting MetaKGP API...")
     
     # Get configuration from environment
-    modal_url = os.getenv("MODAL_URL")
-    if not modal_url:
-        raise RuntimeError("MODAL_URL environment variable not set")
+    modal_url = os.getenv("MODAL_URL")  # Optional - will use local embeddings if not set
     
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
         raise RuntimeError("GROQ_API_KEY environment variable not set")
     
     chroma_dir = os.getenv("CHROMA_DIR", "./chroma_data")
+    cache_dir = os.getenv("CACHE_DIR", "./cache")
     
-    # Initialize query service
-    logger.info("Initializing Query Service...")
+    # Initialize query service with hybrid search
+    logger.info("⚙️ Initializing Query Service with Hybrid Search...")
+    logger.info(f"   - Embedding: sentence-transformers/all-mpnet-base-v2 (768-dim)")
+    logger.info(f"   - Search: Hybrid (70% semantic + 30% keyword)")
+    
     query_service = QueryService(
         modal_url=modal_url,
         chroma_dir=chroma_dir,
-        collection_name="metakgp_wiki"
+        collection_name="metakgp_wiki",
+        cache_dir=cache_dir,
+        use_hybrid=True,
+        semantic_weight=0.7
     )
     set_query_service(query_service)
     
     # Note: GoT engine is initialized lazily in router on first request
-    logger.info("GoT Engine will be initialized on first request (lazy loading)")
+    logger.info("ℹ️ GoT Engine will be initialized on first request (lazy loading)")
     
-    logger.info("All services initialized successfully")
-    logger.info(f"Total documents: {query_service.get_document_count()}")
+    doc_count = query_service.get_document_count()
+    logger.info(f"✅ All services initialized successfully")
+    logger.info(f"📚 Total documents: {doc_count}")
     
     yield
     
     # Shutdown
-    logger.info("Shutting down MetaKGP API...")
+    logger.info("🛑 Shutting down MetaKGP API...")
 
 
 # Create FastAPI app

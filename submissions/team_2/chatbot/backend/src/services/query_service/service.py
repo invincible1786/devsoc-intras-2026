@@ -14,9 +14,21 @@ logger = logging.getLogger(__name__)
 
 
 class QueryService:
-    """Service class for semantic search operations"""
+    """
+    Service class for semantic search operations
     
-    def __init__(self, modal_url: str, chroma_dir: str, collection_name: str = "metakgp_wiki"):
+    Features:
+    - Semantic search via 768-dim embeddings (all-mpnet-base-v2)
+    - Vector similarity using ChromaDB
+    - Optional metadata filtering
+    """
+    
+    def __init__(
+        self,
+        modal_url: str,
+        chroma_dir: str = "./chroma_data",
+        collection_name: str = "metakgp_wiki"
+    ):
         """
         Initialize the query service
         
@@ -25,12 +37,19 @@ class QueryService:
             chroma_dir: Directory for ChromaDB persistence
             collection_name: Name of the ChromaDB collection
         """
+        # Initialize embedding client (Modal API)
         self.embedding_client = ModalEmbeddingClient(modal_url)
+        
+        # Initialize ChromaDB client
         self.chroma_client = MetaKGPChromaClient(
             persist_dir=chroma_dir,
             collection_name=collection_name
         )
-        logger.info(f"QueryService initialized with {self.chroma_client.get_count()} documents")
+        
+        logger.info("✓ QueryService initialized with SEMANTIC search")
+        
+        doc_count = self.chroma_client.get_count()
+        logger.info(f"📚 Loaded {doc_count} documents from ChromaDB")
     
     def get_document_count(self) -> int:
         """Get the total number of documents in the collection"""
@@ -53,67 +72,19 @@ class QueryService:
             category_filter: Optional category filter (applied post-search)
         
         Returns:
-            Dict with 'results' (list of results), 'query_time_ms', and 'total_results'
+            Dict with 'results', 'query_time_ms', 'total_results', and 'search_mode'
         """
         start_time = time.time()
         
-        logger.info(f"Query: {query[:100]}...")
+        logger.info(f"🔍 Query: {query[:100]}...")
         
-        # Generate query embedding
-        query_embedding = self.embedding_client(query)
-        
-        if not query_embedding:
-            raise ValueError("Failed to generate query embedding")
-        
-        logger.info(f"Generated embedding dimension: {len(query_embedding)}")
-        
-        # Search ChromaDB (get more results if we need to filter by category)
-        search_top_k = top_k * 2 if category_filter else top_k
-        
-        results = self.chroma_client.search(
-            query_embedding=query_embedding,
-            top_k=search_top_k,
+        # Perform semantic search
+        logger.info("🧠 Using SEMANTIC search (embeddings)")
+        search_results = self._semantic_search(
+            query=query,
+            top_k=top_k * 2 if category_filter else top_k,
             filters=filters
         )
-        
-        logger.info(f"ChromaDB returned {len(results['ids'])} results")
-        
-        # Format results
-        search_results = []
-        
-        for i, chunk_id in enumerate(results["ids"]):
-            # Convert distance to similarity score [0, 1]
-            distance = results["distances"][i]
-            score = 1.0 / (1.0 + distance)  # Inverse distance normalization
-            
-            # Parse metadata
-            raw_metadata = results["metadatas"][i]
-            
-            # Deserialize arrays
-            categories = raw_metadata.get("categories", "").split(",")
-            categories = [c.strip() for c in categories if c.strip()]
-            
-            entities = raw_metadata.get("entities", "").split(",")
-            entities = [e.strip() for e in entities if e.strip()]
-            
-            # Build result dictionary
-            result = {
-                "chunk_id": chunk_id,
-                "text": results["documents"][i],
-                "score": score,
-                "metadata": {
-                    "source_page": raw_metadata.get("source_page", ""),
-                    "title": raw_metadata.get("title", ""),
-                    "chunk_index": raw_metadata.get("chunk_index", 0),
-                    "total_chunks": raw_metadata.get("total_chunks", 0),
-                    "categories": categories,
-                    "entities": entities,
-                    "entity_count": raw_metadata.get("entity_count", 0),
-                    "relationship_count": raw_metadata.get("relationship_count", 0)
-                }
-            }
-            
-            search_results.append(result)
         
         # Post-process: filter by category if requested
         if category_filter:
@@ -127,10 +98,87 @@ class QueryService:
         # Calculate query time
         query_time_ms = (time.time() - start_time) * 1000
         
-        logger.info(f"Found {len(search_results)} results in {query_time_ms:.1f}ms")
+        logger.info(
+            f"✓ Found {len(search_results)} results in {query_time_ms:.1f}ms"
+        )
         
         return {
             "results": search_results,
             "query_time_ms": query_time_ms,
-            "total_results": len(search_results)
+            "total_results": len(search_results),
+            "search_mode": "semantic"
         }
+    
+    def _semantic_search(
+        self,
+        query: str,
+        top_k: int,
+        filters: Optional[Dict]
+    ) -> List[Dict]:
+        """Perform semantic search using embeddings and ChromaDB"""
+        # Generate query embedding
+        query_embedding = self.embedding_client.encode(query)
+        
+        if query_embedding is None:
+            raise ValueError("Failed to generate query embedding")
+        
+        # Convert to list if numpy array
+        if hasattr(query_embedding, 'tolist'):
+            query_embedding = query_embedding.tolist()
+        
+        logger.info(f"📊 Generated embedding (dimension: {len(query_embedding)})")
+        
+        # Search ChromaDB
+        results = self.chroma_client.search(
+            query_embedding=query_embedding,
+            top_k=top_k,
+            filters=filters
+        )
+        
+        logger.info(f"📦 ChromaDB returned {len(results['ids'])} results")
+        
+        # Format results
+        search_results = []
+        
+        for i, chunk_id in enumerate(results["ids"]):
+            # Get distance and convert to similarity score
+            # ChromaDB returns cosine distance in [0, 2] range
+            # Convert to similarity score in [0, 1] where 1 is most similar
+            distance = results["distances"][i]
+            score = 1.0 - (distance / 2.0)  # Normalize to [0, 1] range
+            score = max(0.0, min(1.0, score))  # Clamp to [0, 1]
+            
+            # Parse metadata
+            raw_metadata = results["metadatas"][i]
+            
+            # Deserialize comma-separated fields
+            categories = raw_metadata.get("categories", "").split(",") if raw_metadata.get("categories") else []
+            categories = [c.strip() for c in categories if c.strip()]
+            
+            entities = raw_metadata.get("entities", "").split(",") if raw_metadata.get("entities") else []
+            entities = [e.strip() for e in entities if e.strip()]
+            
+            # Build result dictionary
+            result = {
+                "chunk_id": chunk_id,
+                "text": results["documents"][i],
+                "score": score,
+                "distance": distance,
+                "rank": i + 1,
+                "metadata": {
+                    "source_page": raw_metadata.get("source_page", ""),
+                    "title": raw_metadata.get("title", ""),
+                    "section": raw_metadata.get("section", ""),
+                    "parent_section": raw_metadata.get("parent_section", ""),
+                    "chunk_index": raw_metadata.get("chunk_index", 0),
+                    "total_chunks": raw_metadata.get("total_chunks", 0),
+                    "categories": categories,
+                    "entities": entities,
+                    "entity_count": raw_metadata.get("entity_count", 0),
+                    "relationship_count": raw_metadata.get("relationship_count", 0)
+                }
+            }
+            
+            search_results.append(result)
+        
+        return search_results

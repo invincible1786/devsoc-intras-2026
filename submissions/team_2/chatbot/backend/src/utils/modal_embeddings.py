@@ -1,6 +1,6 @@
 """
 Modal Embedding Service for MetaKGP RAG System
-Deploys sentence-transformers/all-MiniLM-L6-v2 (384 dimensions) on Modal
+Deploys sentence-transformers/all-mpnet-base-v2 (768 dimensions) on Modal
 """
 
 import modal
@@ -29,14 +29,14 @@ def embed_batch(texts: List[str]) -> List[List[float]]:
     """Batch embed texts using sentence-transformers"""
     from sentence_transformers import SentenceTransformer
     
-    model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-    embeddings = model.encode(texts, batch_size=500, show_progress_bar=False)
+    model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+    embeddings = model.encode(texts, batch_size=100, show_progress_bar=False)
     return embeddings.tolist()
 
 @app.function(image=image)
 def get_embedding_dimension() -> int:
     """Return embedding dimension"""
-    return 384
+    return 768
 
 @app.function(image=image)
 @modal.asgi_app()
@@ -80,12 +80,12 @@ def fastapi_app():
         Returns:
         {
             "status": "ok",
-            "embedding_dimension": 384
+            "embedding_dimension": 768
         }
         """
         return HealthResponse(
             status="ok",
-            embedding_dimension=384
+            embedding_dimension=768
         )
     
     return web_app
